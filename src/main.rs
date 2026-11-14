@@ -1,11 +1,16 @@
 use std::{
-    fs, io, process,
+    env, fs,
+    io::{self, BufRead, BufReader, Read, Write},
+    net::Shutdown,
+    os::unix::net::UnixStream,
+    path::{Path, PathBuf},
+    process,
     sync::{LazyLock, Mutex},
     thread,
     time::Duration,
 };
 
-use hyprland::{data::Client, event_listener, shared::HyprDataActiveOptional};
+use serde::Deserialize;
 use systemd::sd_journal_log;
 
 enum OP {
@@ -73,50 +78,120 @@ fn main() {
     })
     .expect("Failed to register interrupt handler");
 
-    let mut el = event_listener::EventListener::new();
-
-    el.add_active_window_changed_handler(move |_w| {
-        if let Ok(mut prev_lock) = PREVIOUS.lock() {
-            match Client::get_active() {
-                Ok(current) => match (*prev_lock, current) {
-                    (None, None) => (),
-                    (None, Some(client)) => {
-                        write_cgroup_dmem(client.pid, OP::Boost);
-                        *prev_lock = Some(client.pid)
-                    }
-                    (Some(previous), None) => {
-                        write_cgroup_dmem(previous, OP::Revert);
-                        *prev_lock = None
-                    }
-                    (Some(previous), Some(client)) => {
-                        if previous != client.pid {
-                            write_cgroup_dmem(previous, OP::Revert);
-                            write_cgroup_dmem(client.pid, OP::Boost);
-                            *prev_lock = Some(client.pid)
-                        }
-                    }
-                },
-                Err(err) => {
-                    if let Some(previous) = *prev_lock {
-                        write_cgroup_dmem(previous, OP::Revert);
-                        *prev_lock = None
-                    }
-                    sd_journal_log!(4, "Failed to get active window: {err}").unwrap_or(());
-                }
-            }
-        } else {
-            sd_journal_log!(4, "Failed to acquire lock on previous boosted pid").unwrap_or(());
+    let (cmd_sock, event_sock) = match hyprland_sockets() {
+        Ok(paths) => paths,
+        Err(err) => {
+            sd_journal_log!(3, "{err}").unwrap_or(());
+            process::exit(1);
         }
-    });
+    };
 
-    el.start_listener()
-        .inspect_err(|e| {
-            sd_journal_log!(3, "{e}").unwrap_or(());
-        })
-        .expect("Failed to start event listener");
+    sync_active_boost(&cmd_sock);
+
+    if let Err(err) = listen_active_window_events(&event_sock, &cmd_sock) {
+        sd_journal_log!(3, "Event listener stopped: {err}").unwrap_or(());
+        if let Ok(Some(prev)) = PREVIOUS.lock().map(|p| *p) {
+            write_cgroup_dmem(prev, OP::Revert);
+        }
+        process::exit(1);
+    }
 
     if let Ok(Some(prev)) = PREVIOUS.lock().map(|p| *p) {
         write_cgroup_dmem(prev, OP::Revert);
+    }
+}
+
+#[derive(Deserialize)]
+struct ActiveWindow {
+    pid: Option<i32>,
+}
+
+fn hyprland_sockets() -> io::Result<(PathBuf, PathBuf)> {
+    let runtime_dir = env::var("XDG_RUNTIME_DIR")
+        .map_err(|_| io::Error::new(io::ErrorKind::NotFound, "XDG_RUNTIME_DIR is not set"))?;
+    let sig = env::var("HYPRLAND_INSTANCE_SIGNATURE").map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "HYPRLAND_INSTANCE_SIGNATURE is not set (is Hyprland running?)",
+        )
+    })?;
+    let base = Path::new(&runtime_dir).join("hypr").join(sig);
+    Ok((base.join(".socket.sock"), base.join(".socket2.sock")))
+}
+
+fn get_active_pid(cmd_sock: &Path) -> Result<Option<i32>, String> {
+    let mut stream = UnixStream::connect(cmd_sock).map_err(|e| e.to_string())?;
+    stream
+        .write_all(b"j/activewindow")
+        .map_err(|e| e.to_string())?;
+    let _ = stream.shutdown(Shutdown::Write);
+
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .map_err(|e| e.to_string())?;
+
+    let trimmed = response.trim();
+    if trimmed.is_empty() || trimmed == "{}" {
+        return Ok(None);
+    }
+
+    let active: ActiveWindow = serde_json::from_str(trimmed).map_err(|e| e.to_string())?;
+    Ok(active.pid.filter(|&pid| pid > 0))
+}
+
+fn sync_active_boost(cmd_sock: &Path) {
+    let Ok(mut prev_lock) = PREVIOUS.lock() else {
+        sd_journal_log!(4, "Failed to acquire lock on previous boosted pid").unwrap_or(());
+        return;
+    };
+
+    match get_active_pid(cmd_sock) {
+        Ok(current) => match (*prev_lock, current) {
+            (None, None) => (),
+            (None, Some(pid)) => {
+                write_cgroup_dmem(pid, OP::Boost);
+                *prev_lock = Some(pid);
+            }
+            (Some(previous), None) => {
+                write_cgroup_dmem(previous, OP::Revert);
+                *prev_lock = None;
+            }
+            (Some(previous), Some(pid)) => {
+                if previous != pid {
+                    write_cgroup_dmem(previous, OP::Revert);
+                    write_cgroup_dmem(pid, OP::Boost);
+                    *prev_lock = Some(pid);
+                }
+            }
+        },
+        Err(err) => {
+            if let Some(previous) = *prev_lock {
+                write_cgroup_dmem(previous, OP::Revert);
+                *prev_lock = None;
+            }
+            sd_journal_log!(4, "Failed to get active window: {err}").unwrap_or(());
+        }
+    }
+}
+
+fn listen_active_window_events(event_sock: &Path, cmd_sock: &Path) -> io::Result<()> {
+    let stream = UnixStream::connect(event_sock)?;
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+
+    loop {
+        line.clear();
+        let bytes = reader.read_line(&mut line)?;
+        if bytes == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Hyprland event socket closed",
+            ));
+        }
+        if line.starts_with("activewindowv2>>") {
+            sync_active_boost(cmd_sock);
+        }
     }
 }
 
