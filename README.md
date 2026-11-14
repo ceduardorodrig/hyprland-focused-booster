@@ -55,3 +55,12 @@ systemctl --user enable --now hyprland-focused-booster.service # For current use
 # OR
 sudo systemctl --user --global enable hyprland-focused-booster.service # For all users
 ```
+
+<div align="center">
+
+### 🛡️ Human-in-the-Loop Agentic Engineering
+
+Developed by [Carlos Eduardo Rodrigues](https://github.com/ceduardorodrig) with AI coding agents.
+Every change is verified by the deterministic quality gate [StenioSentinel](https://github.com/ceduardorodrig/STENIO-SENTINEL).
+
+</div>
