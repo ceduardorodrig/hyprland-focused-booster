@@ -30,11 +30,16 @@ const VRAM_CGROUP_NAMES: [&str; 2] = ["vram", "vidmem"];
 
 static PREVIOUS: LazyLock<Mutex<Option<i32>>> = LazyLock::new(|| Mutex::new(None));
 static VALUES: LazyLock<ValueString> = LazyLock::new(|| {
-    let (boost, revert): (Vec<String>, Vec<String>) =
-        fs::read_to_string("/sys/fs/cgroup/dmem.capacity")
-            .expect("Could not read GPU devices")
-            .lines()
-            .filter_map(|line| {
+    let capacity_file = match fs::read_to_string("/sys/fs/cgroup/dmem.capacity") {
+        Ok(content) => content,
+        Err(err) => {
+            sd_journal_log!(3, "Could not read GPU devices: {err}").unwrap_or(());
+            process::exit(1);
+        }
+    };
+    let (boost, revert): (Vec<String>, Vec<String>) = capacity_file
+        .lines()
+        .filter_map(|line| {
                 if !VRAM_CGROUP_NAMES
                     .into_iter()
                     .any(|name| line.contains(name))
@@ -63,20 +68,17 @@ static VALUES: LazyLock<ValueString> = LazyLock::new(|| {
 });
 
 fn main() {
-    ctrlc::set_handler(|| {
+    if let Err(err) = ctrlc::set_handler(|| {
         if let Ok(prev_lock) = PREVIOUS.lock() {
             if let Some(previous) = *prev_lock {
                 write_cgroup_dmem(previous, OP::Revert);
-            } else {
-                sd_journal_log!(3, "Failed to revert previous PID dmem.low value").unwrap_or(());
             }
             process::exit(0);
         }
-    })
-    .inspect_err(|e| {
-        sd_journal_log!(3, "{e}").unwrap_or(());
-    })
-    .expect("Failed to register interrupt handler");
+    }) {
+        sd_journal_log!(3, "Failed to register interrupt handler: {err}").unwrap_or(());
+        process::exit(1);
+    }
 
     let (cmd_sock, event_sock) = match hyprland_sockets() {
         Ok(paths) => paths,
