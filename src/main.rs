@@ -42,20 +42,21 @@ static VALUES: LazyLock<ValueString> = LazyLock::new(|| {
             process::exit(1);
         }
     };
-    match parse_dmem_capacity(&capacity_file) {
-        Some(values) => values,
-        None => {
-            sd_journal_log!(3, "Could not find any GPUs").unwrap_or(());
-            process::exit(1);
-        }
-    }
+    let Some(values) = parse_dmem_capacity(&capacity_file) else {
+        sd_journal_log!(3, "Could not find any GPUs").unwrap_or(());
+        process::exit(1);
+    };
+    values
 });
 
 fn parse_dmem_capacity(capacity_file: &str) -> Option<ValueString> {
     let (boost, revert): (Vec<String>, Vec<String>) = capacity_file
         .lines()
         .filter_map(|line| {
-            if !VRAM_CGROUP_NAMES.into_iter().any(|name| line.contains(name)) {
+            if !VRAM_CGROUP_NAMES
+                .into_iter()
+                .any(|name| line.contains(name))
+            {
                 return None;
             }
 
@@ -158,7 +159,9 @@ fn get_active_pid(cmd_sock: &Path) -> Result<Option<i32>, String> {
 }
 
 fn sync_active_boost(cmd_sock: &Path) {
-    let mut prev_lock = PREVIOUS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut prev_lock = PREVIOUS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let generation = BOOST_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
 
     match get_active_pid(cmd_sock) {
