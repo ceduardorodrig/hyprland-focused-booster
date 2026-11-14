@@ -56,6 +56,15 @@ systemctl --user enable --now hyprland-focused-booster.service # For current use
 sudo systemctl --user --global enable hyprland-focused-booster.service # For all users
 ```
 
+## Fork Changes (`fix/hyprland-ipc-activewindow`)
+
+This fork includes several stability, compatibility, and robustness improvements:
+
+- **Direct Unix Socket IPC:** Interacts directly with Hyprland's event (`.socket2.sock` via `activewindowv2>>`) and command (`.socket.sock` via `j/activewindow`) Unix sockets instead of depending on outdated crates (`hyprland = "0.4.0-beta.3"`), preventing deserialization panics caused by newer Hyprland IPC events and fields.
+- **Startup Sync & Clean Shutdown:** Synchronizes the initial active window on startup (`sync_active_boost`) and handles shutdown signals (`SIGINT`/`SIGTERM`) cleanly, ensuring boosted memory settings are properly reverted without noisy error logs.
+- **Non-blocking Retries with Generation Cancellation:** Retries `dmem.low` writes asynchronously with an `AtomicU64` generation counter to safely cancel stale background retries whenever the active window changes, including poisoned-mutex recovery.
+- **Panic-Free Architecture & Unit Tests:** Eliminates `.unwrap()` / `.expect()` panics across runtime paths in accordance with strict safety practices, backed by a comprehensive unit test suite (`cargo test`).
+
 <div align="center">
 
 ### 🛡️ Human-in-the-Loop Agentic Engineering
