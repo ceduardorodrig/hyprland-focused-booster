@@ -1,0 +1,17 @@
+# Dependabot config: one grouped monthly PR. No github-actions entry: this repo has no workflows.
+version: 2
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+      timezone: "America/Sao_Paulo"
+    open-pull-requests-limit: 1
+    groups:
+      rust-dependencies:
+        patterns:
+          - "*"
+    # A major bump needs a manual API review, not an automatic merge.
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
