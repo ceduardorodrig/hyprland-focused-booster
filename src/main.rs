@@ -25,30 +25,35 @@ const VRAM_CGROUP_NAMES: [&str; 2] = ["vram", "vidmem"];
 
 static PREVIOUS: LazyLock<Mutex<Option<i32>>> = LazyLock::new(|| Mutex::new(None));
 static VALUES: LazyLock<ValueString> = LazyLock::new(|| {
-    let (boost, revert): (Vec<String>, Vec<String>) =
-        fs::read_to_string("/sys/fs/cgroup/dmem.capacity")
-            .expect("Could not read GPU devices")
-            .lines()
-            .filter_map(|line| {
-                if !VRAM_CGROUP_NAMES
-                    .into_iter()
-                    .any(|name| line.contains(name))
-                {
-                    return None;
-                }
+    let capacity_file = match fs::read_to_string("/sys/fs/cgroup/dmem.capacity") {
+        Ok(contents) => contents,
+        Err(e) => {
+            sd_journal_log!(3, "Could not read GPU devices: {e}").unwrap_or(());
+            process::exit(1);
+        }
+    };
+    let (boost, revert): (Vec<String>, Vec<String>) = capacity_file
+        .lines()
+        .filter_map(|line| {
+            if !VRAM_CGROUP_NAMES
+                .into_iter()
+                .any(|name| line.contains(name))
+            {
+                return None;
+            }
 
-                let [gpu, capacity] = line.split_whitespace().collect::<Vec<&str>>()[..] else {
-                    return None;
-                };
-                let capacity = capacity.parse::<u64>();
-                if let Ok(capacity) = capacity {
-                    Some((format!("{gpu} {capacity}\n"), format!("{gpu} 0\n")))
-                } else {
-                    sd_journal_log!(4, "Failed to get capacity for device: {gpu}").unwrap_or(());
-                    None
-                }
-            })
-            .collect();
+            let [gpu, capacity] = line.split_whitespace().collect::<Vec<&str>>()[..] else {
+                return None;
+            };
+            let capacity = capacity.parse::<u64>();
+            if let Ok(capacity) = capacity {
+                Some((format!("{gpu} {capacity}\n"), format!("{gpu} 0\n")))
+            } else {
+                sd_journal_log!(4, "Failed to get capacity for device: {gpu}").unwrap_or(());
+                None
+            }
+        })
+        .collect();
 
     if boost.is_empty() || revert.is_empty() {
         sd_journal_log!(3, "Could not find any GPUs").unwrap_or(());
@@ -58,7 +63,7 @@ static VALUES: LazyLock<ValueString> = LazyLock::new(|| {
 });
 
 fn main() {
-    ctrlc::set_handler(|| {
+    if let Err(e) = ctrlc::set_handler(|| {
         if let Ok(prev_lock) = PREVIOUS.lock() {
             if let Some(previous) = *prev_lock {
                 write_cgroup_dmem(previous, OP::Revert);
@@ -67,11 +72,10 @@ fn main() {
             }
             process::exit(0);
         }
-    })
-    .inspect_err(|e| {
-        sd_journal_log!(3, "{e}").unwrap_or(());
-    })
-    .expect("Failed to register interrupt handler");
+    }) {
+        sd_journal_log!(3, "Failed to register interrupt handler: {e}").unwrap_or(());
+        process::exit(1);
+    }
 
     let mut el = event_listener::EventListener::new();
 
@@ -109,11 +113,10 @@ fn main() {
         }
     });
 
-    el.start_listener()
-        .inspect_err(|e| {
-            sd_journal_log!(3, "{e}").unwrap_or(());
-        })
-        .expect("Failed to start event listener");
+    if let Err(e) = el.start_listener() {
+        sd_journal_log!(3, "Failed to start event listener: {e}").unwrap_or(());
+        process::exit(1);
+    }
 
     if let Ok(Some(prev)) = PREVIOUS.lock().map(|p| *p) {
         write_cgroup_dmem(prev, OP::Revert);
